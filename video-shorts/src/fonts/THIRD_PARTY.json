@@ -1,0 +1,38 @@
+{
+  "_comment": "字幕スタイルの書体選択(G-EDIT-CAPTION-STYLE)が同梱する第三者フォントの一覧（正）。ここに無いファイルが dist/…/src/fonts に見つかると配布物検査で未登録として弾かれる。新しい書体を追加するときは、対応するライセンス本文ファイルとあわせてここへ登録すること。",
+  "NotoSansJP-Black.ttf": {
+    "styleKey": "kaku",
+    "family": "Noto Sans JP Black",
+    "source": "Google Fonts (Noto Sans JP, variable font instanced to weight 900)",
+    "license": "LICENSE-NotoSansJP-Black.txt",
+    "spdx": "OFL-1.1"
+  },
+  "NotoSerifJP-Black.ttf": {
+    "styleKey": "mincho",
+    "family": "Noto Serif JP Black",
+    "source": "Google Fonts (Noto Serif JP, variable font instanced to weight 900)",
+    "license": "LICENSE-NotoSerifJP-Black.txt",
+    "spdx": "OFL-1.1"
+  },
+  "MPLUSRounded1c-Black.ttf": {
+    "styleKey": "maru",
+    "family": "M PLUS Rounded 1c Black",
+    "source": "Google Fonts (M PLUS Rounded 1c, static Black weight)",
+    "license": "LICENSE-MPLUSRounded1c-Black.txt",
+    "spdx": "OFL-1.1"
+  },
+  "KosugiMaru-Regular.ttf": {
+    "styleKey": "hand",
+    "family": "Kosugi Maru",
+    "source": "Google Fonts (Kosugi Maru, Regular weight — Black weight not published upstream)",
+    "license": "LICENSE-KosugiMaru-Regular.txt",
+    "spdx": "Apache-2.0"
+  },
+  "YuseiMagic-Regular.ttf": {
+    "styleKey": "marker",
+    "family": "Yusei Magic",
+    "source": "Google Fonts (Yusei Magic, Regular weight — only weight published upstream)",
+    "license": "LICENSE-YuseiMagic-Regular.txt",
+    "spdx": "OFL-1.1"
+  }
+}

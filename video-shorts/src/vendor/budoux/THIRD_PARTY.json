@@ -1,0 +1,16 @@
+{
+  "name": "BudouX",
+  "upstream": "https://github.com/google/budoux",
+  "npmPackage": "budoux",
+  "version": "0.9.0",
+  "copyright": "Copyright 2021 Google LLC",
+  "license": "Apache-2.0",
+  "licenseUrl": "https://www.apache.org/licenses/LICENSE-2.0",
+  "licenseTextInFiles": "各 .mjs の先頭に @license ヘッダ（Apache-2.0 の全文URLを含む）がそのまま残っている",
+  "vendoredFiles": [
+    { "from": "module/parser.js", "to": "parser.mjs", "note": "AdaBoost の推論部だけ。改変は sourceMappingURL コメントの削除のみ" },
+    { "from": "module/data/models/ja.js", "to": "ja-model.mjs", "note": "日本語モデル（学習済みの重み）。改変は sourceMappingURL コメントの削除のみ" }
+  ],
+  "whyVendored": "npm の budoux@0.9.0 は package.json の runtime dependencies に google-artifactregistry-auth が誤って入っており（0.8.0 で混入）、npm install すると 60 パッケージ・約10MB を引く。字幕の分割に必要なのはこの2ファイルだけなので、同梱して依存を増やさない。",
+  "whyUsed": "日本語の改行位置（文節の切れ目）を辞書なし・外部通信なしで決めるため。音声認識の word が部分語（「カ」「メ」「ラ」）で返るため、これが無いと字幕が語の途中で割れる。"
+}

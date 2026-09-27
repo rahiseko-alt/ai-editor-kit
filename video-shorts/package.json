@@ -1,0 +1,10 @@
+{
+  "name": "video-shorts",
+  "private": true,
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "doctor": "node src/edit-job.mjs doctor"
+  }
+}

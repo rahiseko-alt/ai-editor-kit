@@ -1,0 +1,8 @@
+# 作業中のファイル・完成した動画（その PC の中だけに置く）
+.runtime/
+# 文字起こしのキー
+.env
+video-shorts/.env
+# Python の実行時キャッシュ
+__pycache__/
+*.pyc
