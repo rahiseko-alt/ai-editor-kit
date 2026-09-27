@@ -12,10 +12,11 @@
 
 ## 手順
 
-動画を渡されたら、スキル `video-edit-checklist`（`.claude/skills/video-edit-checklist/SKILL.md`）の手順に従う。
-初めて使う PC では、まず `cd video-shorts` → `node src/edit-job.mjs doctor` で必要な物がそろっているか確かめる。
-足りない物があれば、`README.md` の「はじめての準備」の手順を、あなたが代わりに進める
-（インストーラーの操作や API キーの取得など、本人にしかできないことだけを、手順を示して頼む）。
+- 「使えるようにして」「セットアップして」「動かない」と言われたら、**`SETUP-CLAUDE.md` の手順**に従う。
+  ソフトのインストールもあなたが行う（ユーザーは `取扱説明書.pdf` しか読んでいない）。
+- 動画を渡されたら、スキル `video-edit-checklist`（`.claude/skills/video-edit-checklist/SKILL.md`）の手順に従う。
+  その PC で初めて動かすときは、先に `cd video-shorts` → `node src/edit-job.mjs doctor` を実行し、
+  NG があれば `SETUP-CLAUDE.md` の手順で直してから進める。
 
 ## 編集の流れ（原文）
 
