@@ -7,5 +7,8 @@
 # 文字起こし: ローカル(faster-whisper) と クラウド(groq) の二段構え
 faster-whisper==1.2.1
 groq==1.6.0
+# faster-whisper の間接依存。19.x だと faster-whisper 1.2.1 が
+# `metadata_errors` エラーで落ちるため、動作確認済みの版へ固定する（2026-11-14 実証）。
+av==14.2.0
 
 
