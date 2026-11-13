@@ -50,6 +50,7 @@ import { loadPlan, renderScript, validatePlan } from "./editorial/plan-schema.mj
 import { resolveEdl } from "./editorial/resolve-edl.mjs";
 import { chooseSilenceThresholdDb } from "./editorial/silence-threshold.mjs";
 import { alignToFrames, probeFps, renderFinal } from "./render/render-edl.mjs";
+import { generateBoundaryViews } from "./inspect/boundary-view.mjs";
 import { groupIntoPhrases } from "./script/phrases.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -66,7 +67,9 @@ function usage() {
   console.error("       node src/edit-job.mjs prepare <jobId>  （文字起こし〜文節化）");
   console.error("       node src/edit-job.mjs plan <jobId>     （編集案を検査し、台本案を表示）");
   console.error("       node src/edit-job.mjs approve <jobId>  （マスターの承認を記録）");
-  console.error("       node src/edit-job.mjs render <jobId>   （承認済みの編集案を書き出し）");
+  console.error("       node src/edit-job.mjs render <jobId>   （承認済みの編集案を書き出し。境界検品の画像も自動生成）");
+  console.error("       node src/edit-job.mjs inspect <jobId>  （書き出し済みの動画の全境界の検品画像を生成し直す）");
+  console.error("                                               （--out <名前> で試しの書き出し分を指定）");
   console.error("         切り分け用: --no-snap（無音スナップしない） --no-filler（言い淀みを切らない） --no-caption（字幕を焼かない）");
   console.error("                     --out <名前>（outputs/<jobId>/<名前>.mp4 へ書き、完了記録は書かない）");
   process.exit(1);
@@ -135,6 +138,12 @@ function runDoctor() {
   check("ffmpeg", ff.status === 0, "ffmpeg を入れて PATH を通してください（Windows: winget install Gyan.FFmpeg）");
   const fp = spawnSync("ffprobe", ["-version"], { encoding: "utf-8" });
   check("ffprobe", fp.status === 0, "ffmpeg と一緒に入ります（上と同じ）");
+  const filtersText = ff.status === 0 ? (spawnSync("ffmpeg", ["-hide_banner", "-filters"], { encoding: "utf-8" }).stdout ?? "") : "";
+  check(
+    "境界検品の画像化（ffmpeg の drawtext / showwavespic）",
+    /drawtext/.test(filtersText) && /showwavespic/.test(filtersText),
+    "お使いの ffmpeg に drawtext / showwavespic がありません。公式ビルドの ffmpeg を入れ直してください（境界の検品画像が作れません）"
+  );
   let py = null;
   try {
     py = resolvePython();
@@ -755,6 +764,8 @@ async function renderMain(jobId, { noSnap = false, noFiller = false, noCaption =
     // 1区間ずつ揃える（フレーム数0で消えた区間があっても、字幕の語の範囲と並びがずれないように）。
     const aligned = edl.ranges.map((r) => ({ r, a: alignToFrames([r], fps)[0] })).filter((p) => p.a);
     const ranges = aligned.map(({ a }) => ({ start: a.start, end: a.end }));
+    // 境界検品用に、区間の素性（segment・文節番号）を残したままフレーム境界へ揃えたもの。
+    const inspectRanges = aligned.map(({ r, a }) => ({ ...r, start: a.start, end: a.end }));
     const textWindows = aligned.map(({ r, a }) => ({ start: r.textStart ?? a.start, end: r.textEnd ?? a.end }));
     // 書き出しは EDL だけを見る。記録として残す（以前の decision.json はこれに統合した）。
     writeJsonAtomically(path.join(workDir, outName ? `edl-${outName}.json` : "edl.json"), {
@@ -784,6 +795,9 @@ async function renderMain(jobId, { noSnap = false, noFiller = false, noCaption =
     }
     renderFinal({ videoPath: job.video.path, ranges, portrait, assPath, workDir, outPath: resultPath, fps });
     checkCancelled(workDir);
+    // 書き出し後の境界検品の画像化（合格条件 共通項目9）。生成の失敗で書き出し自体を
+    // 失敗にはしないが、その場合は項目9が未判定であることを必ず表示する。
+    reportBoundaryViews({ videoPath: resultPath, ranges: inspectRanges, units, words: transcript.words || [], outDir, outName });
 
     if (outName) {
       console.log(`[切り分け] 書き出しました（完了記録は書きません）: ${resultPath}`);
@@ -818,6 +832,54 @@ async function renderMain(jobId, { noSnap = false, noFiller = false, noCaption =
   }
 }
 
+/**
+ * 境界検品の画像化を実行し、結果（生成先・境界ごとの「疑い」）を表示する。
+ * 方式は src/inspect/boundary-view.mjs（video-use の timeline_view 方式の取り込み）。
+ * 合否はここでは出さない。画像を1枚ずつ開いて合格条件 共通項目9で判定するのは
+ * このセッションの仕事であり、生成できたことは合格の根拠にならない。
+ */
+function reportBoundaryViews({ videoPath, ranges, units, words, outDir, outName = null }) {
+  const dest = path.join(outDir, outName ? `boundaries-${outName}` : "boundaries");
+  try {
+    const { boundaries } = generateBoundaryViews({ videoPath, ranges, units, words, outDir: dest });
+    console.log(`[検品] 境界画像 ${boundaries.length} 枚を生成しました: ${dest}`);
+    for (const b of boundaries) {
+      console.log(`  境界${b.index + 1}（出力 ${b.at} 秒）: ${b.image}${b.flags.length ? `  要確認: ${b.flags.join(" / ")}` : ""}`);
+    }
+    if (boundaries.length) {
+      console.log("  → 画像を1枚ずつ開いて合格条件 共通項目9を判定するまで、「完成」として伝えないでください。");
+    }
+    return boundaries;
+  } catch (err) {
+    console.error(`[検品] 境界画像の生成に失敗しました: ${err.message}`);
+    console.error("  → 合格条件 共通項目9は未判定です。従来どおりコマ抜きで繋ぎ目を確認してください。");
+    return null;
+  }
+}
+
+/** inspect: 書き出し済みの動画について、境界検品の画像だけを生成し直す。 */
+function inspectMain(jobId, { outName = null } = {}) {
+  const workDir = path.join(RUNTIME_DIR, "work", jobId);
+  const outDir = path.join(RUNTIME_DIR, "outputs", jobId);
+  const videoPath = path.join(outDir, outName ? `${outName}.mp4` : "result.mp4");
+  if (!fs.existsSync(videoPath)) throw new Error(`書き出し済みの動画がありません: ${videoPath}（先に render してください）`);
+  const edlPath = path.join(workDir, outName ? `edl-${outName}.json` : "edl.json");
+  if (!fs.existsSync(edlPath)) throw new Error(`EDL がありません: ${edlPath}`);
+  const edl = JSON.parse(fs.readFileSync(edlPath, "utf-8"));
+  const ranges = (edl.ranges ?? []).map((r, i) => ({
+    ...r,
+    start: edl.renderedRanges?.[i]?.start ?? r.start,
+    end: edl.renderedRanges?.[i]?.end ?? r.end,
+  }));
+  if (!ranges.length) throw new Error("EDL に区間がありません");
+  const unitsPath = path.join(workDir, "units.json");
+  const units = fs.existsSync(unitsPath) ? JSON.parse(fs.readFileSync(unitsPath, "utf-8")) : [];
+  const transcriptPath = path.join(workDir, "transcript.json");
+  const words = fs.existsSync(transcriptPath) ? (JSON.parse(fs.readFileSync(transcriptPath, "utf-8")).words ?? []) : [];
+  const boundaries = reportBoundaryViews({ videoPath, ranges, units, words, outDir, outName });
+  if (!boundaries) process.exitCode = 1;
+}
+
 // 以前ここで定義していた関数は、import していた側のために同じ名前で出し続ける。
 export { groupIntoPhrases, renderFinal };
 
@@ -839,7 +901,21 @@ async function main() {
     await newMain(jobId, opts);
     return;
   }
-  if (!cmd || !jobId || !["prepare", "plan", "approve", "render"].includes(cmd)) usage();
+  if (!cmd || !jobId || !["prepare", "plan", "approve", "render", "inspect"].includes(cmd)) usage();
+  if (cmd === "inspect") {
+    let outName = null;
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === "--out" && /^[A-Za-z0-9_-]+$/.test(rest[i + 1] ?? "")) outName = rest[++i];
+      else usage();
+    }
+    try {
+      inspectMain(jobId, { outName });
+    } catch (err) {
+      console.error(`失敗: ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   if (cmd !== "render") {
     if (rest.length) usage();
     if (cmd === "prepare") {
