@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { verifyTranscript, findSoundGaps, findRepeats } from "../src/verify.mjs";
 import { captionViolations } from "../src/review.mjs";
 import { packWordsIntoLines } from "../src/edit-job.mjs";
+import { validateSpec, escapeDrawtext } from "../src/assemble.mjs";
 
 let passed = 0;
 function check(name, fn) {
@@ -70,6 +71,16 @@ check("review: 字幕の行頭禁則と3行以上を検出する", () => {
   assert.equal(v.length, 2);
   assert.equal(v[0].kind, "行頭禁則");
   assert.equal(v[1].kind, "3行以上");
+});
+
+check("assemble: 指示ファイルの検査と drawtext のエスケープ", () => {
+  const ok = validateSpec({ out: "test-reel", clips: [{ file: "a.mp4", start: 1, duration: 3, label: "Before" }] });
+  assert.equal(ok.audio, "mute");
+  assert.equal(ok.clips[0].telop, null);
+  assert.throws(() => validateSpec({ out: "x", clips: [] }), /1つ以上/);
+  assert.throws(() => validateSpec({ out: "x", audio: "loud", clips: [{ file: "a", start: 0, duration: 1 }] }), /"mute" か "keep"/);
+  assert.throws(() => validateSpec({ out: "x", clips: [{ file: "a", start: 0, duration: 0 }] }), /duration/);
+  assert.equal(escapeDrawtext("a:b'c"), "a\\:b\\'c");
 });
 
 console.log(`\n${passed} 件すべて合格`);

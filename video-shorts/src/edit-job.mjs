@@ -55,6 +55,7 @@ import { groupIntoPhrases } from "./script/phrases.mjs";
 import { verifyJob } from "./verify.mjs";
 import { reviewJob } from "./review.mjs";
 import { combineMain } from "./combine.mjs";
+import { assembleMain } from "./assemble.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
@@ -77,6 +78,7 @@ function usage() {
   console.error("       node src/edit-job.mjs review <jobId>   （人間の目線チェック。コンタクトシートと修正案を review フォルダに出す）");
   console.error("                                               （--out <名前> で対象の書き出しを指定）");
   console.error("       node src/edit-job.mjs combine --out <名前> [--landscape] [--no-loudnorm] <動画1> <動画2> ...");
+  console.error("       node src/edit-job.mjs assemble <指示ファイル.json>   （複数素材から場面を切り出し、文字を入れて1本に組み立てる）");
   console.error("                                               （複数の短尺を1本に合算。音は残し、繋ぎ目の境界検品も自動生成）");
   console.error("         切り分け用: --no-snap（無音スナップしない） --no-filler（言い淀みを切らない） --no-caption（字幕を焼かない）");
   console.error("                     --out <名前>（outputs/<jobId>/<名前>.mp4 へ書き、完了記録は書かない）");
@@ -948,6 +950,16 @@ async function main() {
     if (!opts.outName || files.length < 2) usage();
     try {
       combineMain({ inputs: files, outName: opts.outName, landscape: opts.landscape, loudnorm: opts.loudnorm, runtimeDir: RUNTIME_DIR });
+    } catch (err) {
+      console.error(`失敗: ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (cmd === "assemble") {
+    if (!jobId || rest.length) usage();
+    try {
+      assembleMain({ specPath: jobId, runtimeDir: RUNTIME_DIR });
     } catch (err) {
       console.error(`失敗: ${err.message}`);
       process.exitCode = 1;
