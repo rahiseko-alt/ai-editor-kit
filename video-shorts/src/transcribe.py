@@ -75,11 +75,17 @@ def transcribe(model, input_path, lang):
             "text": seg.text.strip(),
         })
         for word in (seg.words or []):
-            words.append({
+            entry = {
                 "w": word.word.strip(),
                 "start": round(word.start, 3),
                 "end": round(word.end, 3),
-            })
+            }
+            # 認識の確信度（0..1）。後の検証（verify）で「聞き取りが怪しい語」を
+            # 機械的に拾うために残す。字幕や編集の既存の挙動には使わない。
+            prob = getattr(word, "probability", None)
+            if prob is not None:
+                entry["p"] = round(float(prob), 3)
+            words.append(entry)
     return {
         "language": info.language,
         "duration": round(info.duration, 3),

@@ -52,6 +52,9 @@ import { chooseSilenceThresholdDb } from "./editorial/silence-threshold.mjs";
 import { alignToFrames, probeFps, renderFinal } from "./render/render-edl.mjs";
 import { generateBoundaryViews } from "./inspect/boundary-view.mjs";
 import { groupIntoPhrases } from "./script/phrases.mjs";
+import { verifyJob } from "./verify.mjs";
+import { reviewJob } from "./review.mjs";
+import { combineMain } from "./combine.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
@@ -70,6 +73,11 @@ function usage() {
   console.error("       node src/edit-job.mjs render <jobId>   （承認済みの編集案を書き出し。境界検品の画像も自動生成）");
   console.error("       node src/edit-job.mjs inspect <jobId>  （書き出し済みの動画の全境界の検品画像を生成し直す）");
   console.error("                                               （--out <名前> で試しの書き出し分を指定）");
+  console.error("       node src/edit-job.mjs verify <jobId>   （文字起こしの検証。要確認と修正案を verify.txt に出す。prepare の最後にも自動実行）");
+  console.error("       node src/edit-job.mjs review <jobId>   （人間の目線チェック。コンタクトシートと修正案を review フォルダに出す）");
+  console.error("                                               （--out <名前> で対象の書き出しを指定）");
+  console.error("       node src/edit-job.mjs combine --out <名前> [--landscape] [--no-loudnorm] <動画1> <動画2> ...");
+  console.error("                                               （複数の短尺を1本に合算。音は残し、繋ぎ目の境界検品も自動生成）");
   console.error("         切り分け用: --no-snap（無音スナップしない） --no-filler（言い淀みを切らない） --no-caption（字幕を焼かない）");
   console.error("                     --out <名前>（outputs/<jobId>/<名前>.mp4 へ書き、完了記録は書かない）");
   process.exit(1);
@@ -393,12 +401,17 @@ function textWidthPx(text, fontSize) {
  * 句読点・無音が検出されない発話区間ではBudouXの文節認識だけで長い塊が1語に融合することがあり
  * （例：「ありますよねあれ該当する」）、割らずに1行として置く既定動作（英単語・URL向け）のままだと
  * 縦型（幅が狭い）で画面端からはみ出す事故になる。実際に c5b1f1f7 ジョブで確認した。 */
+/** 行頭に置いてはいけない文字（句読点・閉じ括弧など）。これで始まる行は「、」だけの行のような
+ * 事故になる（2026-11-14 マスター指摘「、が邪魔」）。割るくらいなら前の行へ寄せる。 */
+const NO_LINE_START_RE = /^[、。，．！？!?:：;；・…‥」』）)】］〉》ー]/;
+
 function breakLongToken(token, budgetPx, fontSize) {
   const lines = [];
   let cur = "";
   for (const ch of token) {
     const candidate = cur + ch;
-    if (cur && textWidthPx(candidate, fontSize) > budgetPx) {
+    // 行頭禁則: 禁則文字は前の塊に残す（多少はみ出しても、禁則文字で始まる行は作らない）。
+    if (cur && textWidthPx(candidate, fontSize) > budgetPx && !NO_LINE_START_RE.test(ch)) {
       lines.push(cur);
       cur = ch;
     } else {
@@ -414,7 +427,8 @@ export function packWordsIntoLines(words, budgetPx, fontSize) {
   let cur = "";
   for (const w of words) {
     const candidate = cur ? cur + w.w : w.w;
-    if (cur && textWidthPx(candidate, fontSize) > budgetPx) {
+    // 行頭禁則: 禁則文字で始まる語は、幅を超えても前の行へ寄せる（「、」だけの行を作らない）。
+    if (cur && textWidthPx(candidate, fontSize) > budgetPx && !NO_LINE_START_RE.test(w.w)) {
       lines.push(cur);
       cur = w.w;
     } else {
@@ -534,7 +548,19 @@ export function buildAssFile(transcript, ranges, assPath, dims, textWindows = nu
   }
   // 語ではなく文節を最小単位にしてから、幅で詰める（語の途中で折れないようにする）。
   // 切れ目が1つも取れなかった場合は、従来どおり語のまま扱う（編集は止めない）。
-  const units = groupIntoPhrases(relWords);
+  const phrases = groupIntoPhrases(relWords);
+  // 句読点だけの文節は直前へ結合する（字幕で「、」だけの行・カードになる事故の防止。
+  // 2026-11-14 マスター指摘）。ここは字幕専用の写しなので、元の文節・時刻には触らない。
+  const units = [];
+  for (const p of phrases) {
+    const prev = units[units.length - 1];
+    if (prev && /^[、。，．！？!?:：;；・…‥」』）)】］〉》]+$/.test(p.w)) {
+      prev.w += p.w;
+      prev.end = Math.max(prev.end, p.end);
+    } else {
+      units.push({ ...p });
+    }
+  }
   const cards = fixDanglingCardTails(buildCaptionCards(units, budgetPx, fontSize), budgetPx, fontSize);
   const LEAD = 0.05;
   const MAXHOLD = 0.6;
@@ -620,6 +646,13 @@ async function prepareMain(jobId) {
     );
     console.log(`  文節 ${units.length} 個。work/${jobId}/units.json を全文読んで、editorial_plan.json を書いてください。`);
     console.log(`  書いたら: node src/edit-job.mjs plan ${jobId}`);
+    // 文字起こしの検証を自動で回す（2026-11-14 マスター要望）。失敗しても prepare は止めない。
+    try {
+      const v = verifyJob(workDir);
+      console.log(`  [検証] 要確認 ${v.total} 件（work/${jobId}/verify.txt に修正案つきで出力）`);
+    } catch (err) {
+      console.error(`  [検証] 実行できませんでした: ${err.message}`);
+    }
   } catch (err) {
     if (err instanceof CancelledError) {
       appendResult({ id: jobId, status: "cancelled", message: err.message, at: new Date().toISOString() });
@@ -899,6 +932,59 @@ async function main() {
       else usage();
     }
     await newMain(jobId, opts);
+    return;
+  }
+  if (cmd === "combine") {
+    const tokens = [jobId, ...rest].filter((t) => t != null);
+    const opts = { outName: null, landscape: false, loudnorm: true };
+    const files = [];
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i] === "--out" && /^[A-Za-z0-9_-]+$/.test(tokens[i + 1] ?? "")) opts.outName = tokens[++i];
+      else if (tokens[i] === "--landscape") opts.landscape = true;
+      else if (tokens[i] === "--no-loudnorm") opts.loudnorm = false;
+      else if (tokens[i].startsWith("--")) usage();
+      else files.push(tokens[i]);
+    }
+    if (!opts.outName || files.length < 2) usage();
+    try {
+      combineMain({ inputs: files, outName: opts.outName, landscape: opts.landscape, loudnorm: opts.loudnorm, runtimeDir: RUNTIME_DIR });
+    } catch (err) {
+      console.error(`失敗: ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (cmd === "verify") {
+    if (!jobId || rest.length) usage();
+    try {
+      const v = verifyJob(path.join(RUNTIME_DIR, "work", jobId));
+      console.log(`文字起こし検証: 要確認 ${v.total} 件。work/${jobId}/verify.txt に修正案つきで出しました。`);
+    } catch (err) {
+      console.error(`失敗: ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (cmd === "review") {
+    if (!jobId) usage();
+    let outName = null;
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === "--out" && /^[A-Za-z0-9_-]+$/.test(rest[i + 1] ?? "")) outName = rest[++i];
+      else usage();
+    }
+    try {
+      const r = reviewJob({
+        workDir: path.join(RUNTIME_DIR, "work", jobId),
+        outDir: path.join(RUNTIME_DIR, "outputs", jobId),
+        outName,
+      });
+      console.log(`人間の目線チェックの材料を出しました: ${r.reviewDir}`);
+      console.log(`  コンタクトシート ${r.sheets.length} 枚と review.txt（修正案 ${r.proposals.length} 件）`);
+      console.log("  → 画像を1枚ずつ開いて合格条件で判定するまで、「完成」として伝えないでください。");
+    } catch (err) {
+      console.error(`失敗: ${err.message}`);
+      process.exitCode = 1;
+    }
     return;
   }
   if (!cmd || !jobId || !["prepare", "plan", "approve", "render", "inspect"].includes(cmd)) usage();
