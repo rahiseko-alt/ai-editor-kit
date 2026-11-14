@@ -51,6 +51,7 @@ export function validateSpec(spec) {
   if (!spec || typeof spec !== "object") throw new Error("指示ファイルは JSON オブジェクトで書いてください");
   if (!/^[A-Za-z0-9_-]+$/.test(spec.out ?? "")) throw new Error("out（出力名）は英数字と - _ だけで書いてください");
   if (spec.audio != null && !["mute", "keep"].includes(spec.audio)) throw new Error('audio は "mute" か "keep" で書いてください');
+  if (spec.bgm != null && typeof spec.bgm !== "string") throw new Error("bgm は曲ファイルのパスで書いてください");
   if (!Array.isArray(spec.clips) || spec.clips.length < 1) throw new Error("clips に場面を1つ以上書いてください");
   spec.clips.forEach((c, i) => {
     const at = `clips[${i}]`;
@@ -62,6 +63,8 @@ export function validateSpec(spec) {
     out: spec.out,
     landscape: spec.landscape === true,
     audio: spec.audio ?? "mute",
+    bgm: spec.bgm ?? null,
+    bgmSync: spec.bgmSync === true,
     clips: spec.clips.map((c) => ({
       file: c.file,
       start: Number(c.start),
@@ -70,6 +73,50 @@ export function validateSpec(spec) {
       telop: c.telop ?? null,
     })),
   };
+}
+
+// 拍への吸着計算（純粋関数）。clips は [{start, duration, sourceDuration}]、
+// beats は秒の配列。場面ごとの終わり（出力タイムラインの累計秒）を一番近い拍へ
+// 寄せ、ずれた分はその場面の duration を伸縮して吸収する。素材の尺を超える
+// 場合は start を前へずらして収め、それでも無理ならその境界は吸着しない。
+// 戻り値: [{start, duration, snapped, target}]（target は狙った境界秒）。
+export function snapDurations(clips, beats) {
+  let cum = 0;
+  return clips.map((clip) => {
+    let { start, duration } = clip;
+    let snapped = false;
+    const end = cum + duration;
+    let target = end;
+    if (Array.isArray(beats) && beats.length) {
+      const beat = beats.reduce((best, b) => (Math.abs(b - end) < Math.abs(best - end) ? b : best), beats[0]);
+      const d2 = duration + (beat - end);
+      if (Math.abs(beat - end) > 0.01 && d2 >= 1.0) {
+        if (start + d2 <= clip.sourceDuration + 0.05) {
+          duration = d2; snapped = true; target = beat;
+        } else {
+          const start2 = round3(clip.sourceDuration - d2);
+          if (start2 >= 0) { start = start2; duration = d2; snapped = true; target = beat; }
+        }
+      }
+    }
+    cum += duration;
+    return { start: round3(start), duration: round3(duration), snapped, target: round3(target) };
+  });
+}
+
+const round3 = (n) => Math.round(n * 1000) / 1000;
+
+// librosa で曲の拍位置を取る（src/beat.py 経由）。librosa が無い環境では例外。
+export function getBeats(bgmPath) {
+  const script = path.join(__dirname, "beat.py");
+  let py = null;
+  for (const cand of ["python3", "python"]) {
+    if (spawnSync(cand, ["--version"], { encoding: "utf-8" }).status === 0) { py = cand; break; }
+  }
+  if (!py) throw new Error("実行可能な python が見つかりません");
+  const r = spawnSync(py, [script, bgmPath], { encoding: "utf-8", maxBuffer: 64 * 1024 * 1024 });
+  if (r.status !== 0) throw new Error(`拍の取得ができませんでした: ${(r.stderr ?? "").trim().split("\n").pop() ?? ""}`);
+  return JSON.parse(r.stdout.trim().split("\n").pop());
 }
 
 function buildSegment(clip, { segPath, W, H, audio }) {
@@ -96,11 +143,31 @@ export function assembleFromSpec({ spec, specDir, runtimeDir }) {
   const H = s.landscape ? 1080 : 1920;
   const workDir = path.join(runtimeDir, "work", `assemble-${s.out}`);
   fs.mkdirSync(workDir, { recursive: true });
-  const segPaths = s.clips.map((clip, i) => {
+  // BGM（任意）。ファイルが無い場合は警告して BGM なしで続ける。
+  let bgmPath = null;
+  if (s.bgm) {
+    const resolvedBgm = path.isAbsolute(s.bgm) ? s.bgm : path.resolve(specDir, s.bgm);
+    if (fs.existsSync(resolvedBgm)) bgmPath = resolvedBgm;
+    else console.error(`[警告] BGM が見つからないため、BGM なしで続行します: ${resolvedBgm}`);
+  }
+  // 拍同期（任意）。librosa が無い環境では警告して同期なしで続ける。
+  let beatInfo = null;
+  if (s.bgmSync && bgmPath) {
+    try {
+      beatInfo = getBeats(bgmPath);
+    } catch (err) {
+      console.error(`[警告] ${err.message} 拍同期なしで続行します。`);
+    }
+  }
+  const resolvedClips = s.clips.map((clip) => {
     const resolved = path.isAbsolute(clip.file) ? clip.file : path.resolve(specDir, clip.file);
     if (!fs.existsSync(resolved)) throw new Error(`素材がありません: ${resolved}`);
+    return { ...clip, file: resolved, sourceDuration: probeClip(resolved).duration };
+  });
+  const applied = beatInfo ? snapDurations(resolvedClips, beatInfo.beats) : resolvedClips.map((c) => ({ start: c.start, duration: c.duration, snapped: false, target: null }));
+  const segPaths = resolvedClips.map((clip, i) => {
     const segPath = path.join(workDir, `seg${i + 1}.mp4`);
-    buildSegment({ ...clip, file: resolved }, { segPath, W, H, audio: s.audio });
+    buildSegment({ ...clip, start: applied[i].start, duration: applied[i].duration }, { segPath, W, H, audio: s.audio });
     return segPath;
   });
   const outDir = path.join(runtimeDir, "outputs", "combined");
@@ -113,16 +180,44 @@ export function assembleFromSpec({ spec, specDir, runtimeDir }) {
     ranges = [{ start: 0, end: probeClip(segPaths[0]).duration }];
     totalDuration = ranges[0].end;
   } else {
-    ({ ranges, totalDuration } = combineVideos({ inputs: segPaths, outPath, landscape: s.landscape, loudnorm: s.audio === "keep" }));
+    // BGM を載せる場合は、最終の loudnorm はミックス側で1回だけかける。
+    ({ ranges, totalDuration } = combineVideos({ inputs: segPaths, outPath, landscape: s.landscape, loudnorm: s.audio === "keep" && !bgmPath }));
   }
-  return { outPath, ranges, totalDuration, segPaths };
+  return { outPath, ranges, totalDuration, segPaths, bgmPath, beatInfo, applied };
+}
+
+// BGM を載せる最終ミックス。mute: BGM のみ。keep: 会話を主、BGM は -18dB 目安で下に敷く。
+// 全体の音量は loudnorm（I=-16）で揃える（キットの既存方針）。
+function muxBgm(videoPath, bgmPath, mode) {
+  const { duration } = probeClip(videoPath);
+  const tmp = videoPath.replace(/\.mp4$/, ".bgm.mp4");
+  const dur = duration.toFixed(3);
+  const filter = mode === "keep"
+    ? `[1:a]aresample=48000,volume=-18dB,atrim=0:${dur},asetpts=PTS-STARTPTS[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=0,loudnorm=I=-16:TP=-1.5:LRA=11[out]`
+    : `[1:a]aresample=48000,atrim=0:${dur},asetpts=PTS-STARTPTS,loudnorm=I=-16:TP=-1.5:LRA=11[out]`;
+  runSync("ffmpeg", ["-y", "-v", "error", "-i", videoPath, "-stream_loop", "-1", "-i", bgmPath,
+    "-filter_complex", filter, "-map", "0:v", "-map", "[out]",
+    "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", tmp]);
+  fs.renameSync(tmp, videoPath);
 }
 
 export function assembleMain({ specPath, runtimeDir }) {
   const abs = path.resolve(specPath);
   if (!fs.existsSync(abs)) throw new Error(`指示ファイルがありません: ${abs}`);
   const spec = JSON.parse(fs.readFileSync(abs, "utf-8"));
-  const { outPath, ranges, totalDuration } = assembleFromSpec({ spec, specDir: path.dirname(abs), runtimeDir });
+  const { outPath, ranges, totalDuration, bgmPath, beatInfo, applied } = assembleFromSpec({ spec, specDir: path.dirname(abs), runtimeDir });
+  if (beatInfo) {
+    console.log(`拍同期: テンポ ${beatInfo.tempo} BPM / 拍 ${beatInfo.beats.length} 件`);
+    let cum = 0;
+    applied.forEach((a, i) => {
+      cum += a.duration;
+      if (a.snapped) console.log(` 場面${i + 1}の終わり ${cum.toFixed(2)} 秒（拍 ${a.target} 秒に吸着）`);
+    });
+  }
+  if (bgmPath) {
+    muxBgm(outPath, bgmPath, spec.audio ?? "mute");
+    console.log(`BGM を載せました: ${bgmPath}（${(spec.audio ?? "mute") === "keep" ? "会話主・BGM -18dB" : "BGM のみ"}）`);
+  }
   console.log(`組み立てました: ${outPath}（${ranges.length} 場面 / 合計 ${totalDuration.toFixed(1)} 秒）`);
   if (ranges.length > 1) {
     try {

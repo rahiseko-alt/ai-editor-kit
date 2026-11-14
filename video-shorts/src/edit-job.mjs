@@ -56,6 +56,8 @@ import { verifyJob } from "./verify.mjs";
 import { reviewJob } from "./review.mjs";
 import { combineMain } from "./combine.mjs";
 import { assembleMain } from "./assemble.mjs";
+import { tempoMain } from "./tempo.mjs";
+import { findDeepFilter, denoiseAudio } from "./denoise.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
@@ -68,7 +70,8 @@ function usage() {
   console.error("使い方: node src/edit-job.mjs doctor         （必要な物がそろっているか確かめる）");
   console.error("       node src/edit-job.mjs new <動画のパス> [--portrait] [--caption] [--instruction <指示>]");
   console.error("                                               （ジョブを登録して prepare まで実行。既定は横型・字幕なし）");
-  console.error("       node src/edit-job.mjs prepare <jobId>  （文字起こし〜文節化）");
+  console.error("       node src/edit-job.mjs prepare <jobId> [--denoise]  （文字起こし〜文節化。--denoise は音を掃除してから文字起こし）");
+  console.error("       node src/edit-job.mjs tempo <動画のパス>   （カット位置を検出し、シーン一覧とテンポ統計を出す）");
   console.error("       node src/edit-job.mjs plan <jobId>     （編集案を検査し、台本案を表示）");
   console.error("       node src/edit-job.mjs approve <jobId>  （マスターの承認を記録）");
   console.error("       node src/edit-job.mjs render <jobId>   （承認済みの編集案を書き出し。境界検品の画像も自動生成）");
@@ -173,6 +176,15 @@ function runDoctor() {
       `次のどちらかを用意してください:\n      (速い) pip install groq を実行し、video-shorts/.env に GROQ_API_KEY=... を書く（キーは https://console.groq.com で無料発行）\n      (キー不要・遅い) ${py} -m pip install -r video-shorts/requirements.txt`
     );
   }
+  // 任意の部品（無くても動く。対応する任意機能だけが使えなくなる）
+  const df = spawnSync("deep-filter", ["--help"], { encoding: "utf-8" });
+  lines.push(`任意  音の掃除 deep-filter（prepare --denoise 用）: ${df.status === 0 ? "使える" : "使えない（無くても動きます）"}`);
+  if (py) {
+    const opt = spawnSync(py, ["-c", "import importlib.util as u;print(bool(u.find_spec('scenedetect')), bool(u.find_spec('librosa')))"], { encoding: "utf-8" });
+    const [hasSD, hasLibrosa] = (opt.stdout ?? "").trim().split(/\s+/).map((v) => v === "True");
+    lines.push(`任意  テンポ計測 scenedetect（tempo / review のテンポ項目用）: ${hasSD ? "使える" : "使えない（無くても動きます）"}`);
+    lines.push(`任意  BGMビート同期 librosa（assemble の bgmSync 用）: ${hasLibrosa ? "使える" : "使えない（無くても動きます）"}`);
+  }
   console.log(lines.join("\n"));
   console.log(ok ? "\nすべてそろっています。" : "\n足りない物があります。上の → の手順で入れてから、もう一度 doctor を実行してください。");
   return ok ? 0 : 1;
@@ -228,11 +240,11 @@ function runSync(cmd, args, opts = {}) {
 }
 
 // ---------- 1. 文字起こし ----------
-function transcribe(videoPath, workDir) {
+function transcribe(videoPath, workDir, { audioPath = null } = {}) {
   const py = resolvePython();
   const out = path.join(workDir, "transcript.json");
   console.log("[1/8] 文字起こし中（Groqがあれば自動使用）…");
-  runSync(py, [path.join(VIDEO_SHORTS_DIR, "src", "transcribe.py"), videoPath, out, "--lang", "ja", "--backend", "auto"], {
+  runSync(py, [path.join(VIDEO_SHORTS_DIR, "src", "transcribe.py"), audioPath ?? videoPath, out, "--lang", "ja", "--backend", "auto"], {
     cwd: VIDEO_SHORTS_DIR,
   });
   return JSON.parse(fs.readFileSync(out, "utf-8"));
@@ -609,7 +621,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 //                                          （keep.json はこのセッションが直接書く）
 
 /** prepare: 文字起こし・無音実測・文節化までを行い、判断材料を work/<jobId> に残す。 */
-async function prepareMain(jobId) {
+async function prepareMain(jobId, { denoise = false } = {}) {
   const job = readInboxJob(jobId);
   const workDir = path.join(RUNTIME_DIR, "work", jobId);
   const outDir = path.join(RUNTIME_DIR, "outputs", jobId);
@@ -623,7 +635,25 @@ async function prepareMain(jobId) {
     }
     console.log(`[0/4] 受け取った指示: ${job.instruction ? job.instruction : "（指示なし）"}`);
     checkCancelled(workDir);
-    transcribe(job.video.path, workDir);
+    // --denoise: 文字起こしにだけ、deep-filter で掃除した音声を使う（任意機能）。
+    // deep-filter が無い・失敗した場合は警告を出して通常の文字起こしへ進む。
+    let audioPath = null;
+    if (denoise) {
+      const df = findDeepFilter();
+      if (!df) {
+        console.error("[denoise] deep-filter が見つからないため、音の掃除なしで文字起こしします。");
+      } else {
+        try {
+          console.log("[denoise] 音声を取り出して deep-filter で掃除しています…");
+          audioPath = denoiseAudio({ videoPath: job.video.path, workDir, deepFilter: df });
+          console.log(`[denoise] 掃除済み音声で文字起こしします: ${audioPath}`);
+        } catch (err) {
+          console.error(`[denoise] 掃除に失敗したため、通常の文字起こしへ進みます: ${err.message}`);
+          audioPath = null;
+        }
+      }
+    }
+    transcribe(job.video.path, workDir, { audioPath });
     checkCancelled(workDir);
     // 誤字直し（裏で claude -p を呼ぶ工程）は 2026-09-27 に外した（マスター決定）。他の人の PC では
     // claude コマンドが無い・認証が切れている可能性が高く、実際に認証切れで失敗していた。台本を読んで
@@ -999,6 +1029,17 @@ async function main() {
     }
     return;
   }
+  if (cmd === "tempo") {
+    if (!jobId || rest.length) usage();
+    try {
+      tempoMain({ videoPath: jobId, runtimeDir: RUNTIME_DIR });
+    } catch (err) {
+      console.error(`失敗: ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   if (!cmd || !jobId || !["prepare", "plan", "approve", "render", "inspect"].includes(cmd)) usage();
   if (cmd === "inspect") {
     let outName = null;
@@ -1015,11 +1056,16 @@ async function main() {
     return;
   }
   if (cmd !== "render") {
-    if (rest.length) usage();
     if (cmd === "prepare") {
-      await prepareMain(jobId);
+      let denoise = false;
+      for (const t of rest) {
+        if (t === "--denoise") denoise = true;
+        else usage();
+      }
+      await prepareMain(jobId, { denoise });
       return;
     }
+    if (rest.length) usage();
     try {
       if (cmd === "plan") planMain(jobId);
       else approveMain(jobId);

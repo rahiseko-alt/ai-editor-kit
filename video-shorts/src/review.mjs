@@ -17,6 +17,7 @@ import { spawnSync} from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { verifyJob} from "./verify.mjs";
+import { analyzeTempo } from "./tempo.mjs";
 
 const NO_LINE_START_RE = /^[、。，．！？!?:：;；・…‥」』）)】］〉》ー]/;
 
@@ -125,6 +126,14 @@ const max = Number(err.match(/max_volume:\s*(-?[\d.]+)/)?.[1]);
 if (Number.isFinite(mean) && mean < -32) proposals.push(`音量: 平均 ${mean} dB（全体に小さい。音量を上げて書き直し）`);
 if (Number.isFinite(max) && max > -0.3) proposals.push(`音量: 最大 ${max} dB（0dBに張り付き。クリップの疑い）`);
 } catch { /* 音量が取れなくても材料作りは続行 */ }
+
+// テンポ（材料のみ。合否は出さない）。scenedetect が無い環境では未計測と書く。
+try {
+const t = analyzeTempo(videoPath);
+proposals.push(`テンポ: シーン ${t.stats.count}（カット ${t.stats.cuts}）/ カット長 平均 ${t.stats.average} 秒・中央値 ${t.stats.median} 秒 / 冒頭シーン ${t.stats.firstScene} 秒 / 最長シーン ${t.stats.longest.duration} 秒`);
+} catch {
+proposals.push("テンポ: 未計測（scenedetect が無い環境では計測できません）");
+}
 
 const lines = [];
 lines.push("人間の目線チェック（review）: 修正案リスト");

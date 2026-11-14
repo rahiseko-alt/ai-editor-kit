@@ -11,4 +11,11 @@ groq==1.6.0
 # `metadata_errors` エラーで落ちるため、動作確認済みの版へ固定する（2026-11-14 実証）。
 av==14.2.0
 
+# テンポ計測（tempo / review のテンポ項目）: PySceneDetect
+scenedetect==0.7.3
+# BGMビート同期（assemble の bgmSync）を使う場合のみ追加で入れる（任意）:
+#   pip install librosa
+# 音の掃除（prepare --denoise）は Python ではなく deep-filter の実行ファイルを
+# PATH へ置く（GitHub の Rikorose/DeepFilterNet のリリースから取得）。
+
 
