@@ -10,6 +10,10 @@
 // {
 //   "out": "fizze-ba-reel",            // 出力名（outputs/combined/<out>.mp4）
 //   "landscape": false,                // 省略時 false（縦型 1080x1920）
+//   "fit": "crop",                     // 省略時 "crop"（画面いっぱいに拡大して切る）。
+//                                      // "blur" はピラーボックス（中央に切らずに置き、
+//                                      // 両脇を同じ映像のぼかし背景で埋める）。
+//                                      // 縦素材を landscape で使うときに選ぶ
 //   "audio": "mute",                   // "mute"（既定。BGM は投稿時に付ける前提）
 //                                      // または "keep"（素材の音を残し loudnorm で揃える）
 //   "clips": [
@@ -25,7 +29,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { combineVideos, probeClip } from "./combine.mjs";
+import { combineVideos, probeClip, videoFitChains, FIT_MODES } from "./combine.mjs";
 import { generateBoundaryViews } from "./inspect/boundary-view.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -52,6 +56,7 @@ export function validateSpec(spec) {
   if (!/^[A-Za-z0-9_-]+$/.test(spec.out ?? "")) throw new Error("out（出力名）は英数字と - _ だけで書いてください");
   if (spec.audio != null && !["mute", "keep"].includes(spec.audio)) throw new Error('audio は "mute" か "keep" で書いてください');
   if (spec.bgm != null && typeof spec.bgm !== "string") throw new Error("bgm は曲ファイルのパスで書いてください");
+  if (spec.fit != null && !FIT_MODES.includes(spec.fit)) throw new Error('fit は "crop" か "blur" で書いてください');
   if (!Array.isArray(spec.clips) || spec.clips.length < 1) throw new Error("clips に場面を1つ以上書いてください");
   spec.clips.forEach((c, i) => {
     const at = `clips[${i}]`;
@@ -62,6 +67,7 @@ export function validateSpec(spec) {
   return {
     out: spec.out,
     landscape: spec.landscape === true,
+    fit: spec.fit ?? "crop",
     audio: spec.audio ?? "mute",
     bgm: spec.bgm ?? null,
     bgmSync: spec.bgmSync === true,
@@ -119,19 +125,22 @@ export function getBeats(bgmPath) {
   return JSON.parse(r.stdout.trim().split("\n").pop());
 }
 
-function buildSegment(clip, { segPath, W, H, audio }) {
-  const vfilters = [`scale=${W}:${H}:force_original_aspect_ratio=increase`, `crop=${W}:${H}`, "setsar=1", "fps=30"];
+function buildSegment(clip, { segPath, W, H, audio, fit = "crop" }) {
+  // 画の揃え方（crop / blur ピラーボックス）は combine と共通のチェーン。
+  // ラベルとテロップは揃えた後の画面全体に対して描く。
+  const chains = videoFitChains("[0:v]", W, H, fit, "s", "[vb]");
+  const draw = [];
   if (clip.label) {
-    vfilters.push(`drawtext=fontfile='${FONT_PATH}':text='${escapeDrawtext(clip.label)}':fontsize=72:fontcolor=white:borderw=3:bordercolor=black@0.6:x=60:y=120`);
+    draw.push(`drawtext=fontfile='${FONT_PATH}':text='${escapeDrawtext(clip.label)}':fontsize=72:fontcolor=white:borderw=3:bordercolor=black@0.6:x=60:y=120`);
   }
   if (clip.telop) {
-    vfilters.push(`drawtext=fontfile='${FONT_PATH}':text='${escapeDrawtext(clip.telop)}':fontsize=54:fontcolor=white:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=h-260`);
+    draw.push(`drawtext=fontfile='${FONT_PATH}':text='${escapeDrawtext(clip.telop)}':fontsize=54:fontcolor=white:borderw=3:bordercolor=black@0.6:x=(w-text_w)/2:y=h-260`);
   }
-  const args = ["-y", "-v", "error", "-ss", String(clip.start), "-t", String(clip.duration), "-i", clip.file, "-vf", vfilters.join(",")];
+  chains.push(`[vb]${draw.length ? draw.join(",") : "null"}[vout]`);
+  const args = ["-y", "-v", "error", "-ss", String(clip.start), "-t", String(clip.duration), "-i", clip.file,
+    "-filter_complex", chains.join(";"), "-map", "[vout]"];
   if (audio === "keep") {
-    args.push("-af", "aresample=48000,aformat=channel_layouts=stereo", "-c:a", "aac", "-b:a", "160k");
-  } else {
-    args.push("-an");
+    args.push("-map", "0:a", "-af", "aresample=48000,aformat=channel_layouts=stereo", "-c:a", "aac", "-b:a", "160k");
   }
   args.push("-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p", segPath);
   runSync("ffmpeg", args);
@@ -167,7 +176,7 @@ export function assembleFromSpec({ spec, specDir, runtimeDir }) {
   const applied = beatInfo ? snapDurations(resolvedClips, beatInfo.beats) : resolvedClips.map((c) => ({ start: c.start, duration: c.duration, snapped: false, target: null }));
   const segPaths = resolvedClips.map((clip, i) => {
     const segPath = path.join(workDir, `seg${i + 1}.mp4`);
-    buildSegment({ ...clip, start: applied[i].start, duration: applied[i].duration }, { segPath, W, H, audio: s.audio });
+    buildSegment({ ...clip, start: applied[i].start, duration: applied[i].duration }, { segPath, W, H, audio: s.audio, fit: s.fit });
     return segPath;
   });
   const outDir = path.join(runtimeDir, "outputs", "combined");
@@ -181,7 +190,7 @@ export function assembleFromSpec({ spec, specDir, runtimeDir }) {
     totalDuration = ranges[0].end;
   } else {
     // BGM を載せる場合は、最終の loudnorm はミックス側で1回だけかける。
-    ({ ranges, totalDuration } = combineVideos({ inputs: segPaths, outPath, landscape: s.landscape, loudnorm: s.audio === "keep" && !bgmPath }));
+    ({ ranges, totalDuration } = combineVideos({ inputs: segPaths, outPath, landscape: s.landscape, fit: s.fit, loudnorm: s.audio === "keep" && !bgmPath }));
   }
   return { outPath, ranges, totalDuration, segPaths, bgmPath, beatInfo, applied };
 }

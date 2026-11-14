@@ -4,7 +4,11 @@
 // 複数素材の組み立てや、書き出し済み短尺の連結に使う（2026-11-14 マスター要望）。
 // 仕様:
 // - 画は全て同じ寸法へ揃える（既定は縦型 1080x1920。--landscape で 1920x1080）。
-// 揃え方は「画面いっぱいに拡大してはみ出しを切る」（cover）。fps は 30 に統一。
+// 揃え方は fit で選ぶ（既定 "crop" は「画面いっぱいに拡大してはみ出しを切る」
+// cover）。fps は 30 に統一。
+// - fit "blur" はピラーボックス: 素材を切らずに高さへ合わせて中央に置き、
+// 両脇は同じ映像を画面いっぱいに広げて強くぼかし、少し暗くした背景で埋める。
+// 縦素材を横型（YouTube 等）へ入れても頭や髪が欠けないための方式。
 // - 音は必ず残す（無音の素材には無音トラックを補う）。最後に loudnorm で
 // 音量を揃える（--no-loudnorm で無効）。
 // - 繋ぎ目ごとに境界検品の画像も自動生成する（方式は inspect と同じ）。
@@ -31,8 +35,25 @@ hasAudio: (j.streams?? []).some((s) => s.codec_type === "audio"),
 };
 }
 
-export function combineVideos({ inputs, outPath, landscape = false, loudnorm = true}) {
+export const FIT_MODES = ["crop", "blur"];
+
+// 1素材を W x H の画へ揃える映像チェーン（filter_complex の断片を配列で返す）。
+// input は "[0:v]" の形、out は "[v0]" の形。tag は分岐ラベルの重複避け。
+export function videoFitChains(input, W, H, fit, tag, out) {
+if (fit === "blur") {
+return [
+`${input}split=2[${tag}src1][${tag}src2]`,
+`[${tag}src1]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},gblur=sigma=50,eq=brightness=-0.08[${tag}bg]`,
+`[${tag}src2]scale=-2:${H}[${tag}fg]`,
+`[${tag}bg][${tag}fg]overlay=(W-w)/2:0,setsar=1,fps=30${out}`,
+];
+}
+return [`${input}scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=30${out}`];
+}
+
+export function combineVideos({ inputs, outPath, landscape = false, loudnorm = true, fit = "crop"}) {
 if (!inputs || inputs.length < 2) throw new Error("合算には2本以上の動画が必要です");
+if (!FIT_MODES.includes(fit)) throw new Error(`fit は "crop" か "blur" で指定してください（今: ${fit}）`);
 for (const f of inputs) if (!fs.existsSync(f)) throw new Error(`動画がありません: ${f}`);
 const W = landscape? 1920: 1080;
 const H = landscape? 1080: 1920;
@@ -41,7 +62,7 @@ const args = ["-y", "-v", "error"];
 for (const c of clips) args.push("-i", c.path);
 const chains = [];
 clips.forEach((c, i) => {
-chains.push(`[${i}:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=30[v${i}]`);
+chains.push(...videoFitChains(`[${i}:v]`, W, H, fit, `c${i}`, `[v${i}]`));
 chains.push(c.hasAudio
 ? `[${i}:a]aresample=48000,aformat=channel_layouts=stereo[a${i}]`
 : `anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:${c.duration.toFixed(3)}[a${i}]`);
@@ -64,11 +85,11 @@ return r;
 return { ranges, totalDuration: base};
 }
 
-export function combineMain({ inputs, outName, landscape, loudnorm, runtimeDir}) {
+export function combineMain({ inputs, outName, landscape, loudnorm, fit = "crop", runtimeDir}) {
 const outDir = path.join(runtimeDir, "outputs", "combined");
 fs.mkdirSync(outDir, { recursive: true});
 const outPath = path.join(outDir, `${outName}.mp4`);
-const { ranges, totalDuration} = combineVideos({ inputs, outPath, landscape, loudnorm});
+const { ranges, totalDuration} = combineVideos({ inputs, outPath, landscape, loudnorm, fit});
 console.log(`合算しました: ${outPath}（${inputs.length} 本 / 合計 ${totalDuration.toFixed(1)} 秒）`);
 try {
 const dest = path.join(outDir, `boundaries-combined-${outName}`);

@@ -45,7 +45,15 @@ import { fileURLToPath } from "node:url";
 import { writeJsonAtomically } from "./atomic-json.mjs";
 import { wordsInRange, assTime } from "./srt-builder.mjs";
 import { FONT_CATALOG, fontSizeForHeight } from "./subtitle-styles.mjs";
-import { approvalProblem, writeApproval } from "./editorial/approval.mjs";
+import { approvalProblem, sha256, writeApproval } from "./editorial/approval.mjs";
+import {
+  assertCaptionsProofed,
+  checkReadability,
+  collectVerifyFlags,
+  cueProvenance,
+  formatCaptionsTxt,
+  checkProof,
+} from "./captions.mjs";
 import { loadPlan, renderScript, validatePlan } from "./editorial/plan-schema.mjs";
 import { resolveEdl } from "./editorial/resolve-edl.mjs";
 import { chooseSilenceThresholdDb } from "./editorial/silence-threshold.mjs";
@@ -74,13 +82,16 @@ function usage() {
   console.error("       node src/edit-job.mjs tempo <動画のパス>   （カット位置を検出し、シーン一覧とテンポ統計を出す）");
   console.error("       node src/edit-job.mjs plan <jobId>     （編集案を検査し、台本案を表示）");
   console.error("       node src/edit-job.mjs approve <jobId>  （マスターの承認を記録）");
+  console.error("       node src/edit-job.mjs captions <jobId> [--check]  （字幕の生成と校正用一覧の出力。--check は校正の照合だけを行う）");
+  console.error("                                               （字幕ありジョブ必須の工程。校正の手順は docs/字幕校正の手順.md、照合を通らないと render で字幕を焼けない）");
   console.error("       node src/edit-job.mjs render <jobId>   （承認済みの編集案を書き出し。境界検品の画像も自動生成）");
   console.error("       node src/edit-job.mjs inspect <jobId>  （書き出し済みの動画の全境界の検品画像を生成し直す）");
   console.error("                                               （--out <名前> で試しの書き出し分を指定）");
   console.error("       node src/edit-job.mjs verify <jobId>   （文字起こしの検証。要確認と修正案を verify.txt に出す。prepare の最後にも自動実行）");
   console.error("       node src/edit-job.mjs review <jobId>   （人間の目線チェック。コンタクトシートと修正案を review フォルダに出す）");
   console.error("                                               （--out <名前> で対象の書き出しを指定）");
-  console.error("       node src/edit-job.mjs combine --out <名前> [--landscape] [--no-loudnorm] <動画1> <動画2> ...");
+  console.error("       node src/edit-job.mjs combine --out <名前> [--landscape] [--no-loudnorm] [--fit crop|blur] <動画1> <動画2> ...");
+  console.error("                                               （--fit blur は縦素材を切らずに中央へ置き、両脇を同じ映像のぼかし背景で埋める）");
   console.error("       node src/edit-job.mjs assemble <指示ファイル.json>   （複数素材から場面を切り出し、文字を入れて1本に組み立てる）");
   console.error("                                               （複数の短尺を1本に合算。音は残し、繋ぎ目の境界検品も自動生成）");
   console.error("         切り分け用: --no-snap（無音スナップしない） --no-filler（言い淀みを切らない） --no-caption（字幕を焼かない）");
@@ -343,6 +354,28 @@ function probeDimensions(videoPath) {
 ///    極端に短いカードが乱発しないようにする）。この早期区切りは常に「必須条件（行数の上限）」
 //     より弱いので、外れても2行以内という保証そのものは揺らがない。
 
+let termCorrectionsCache = null;
+/** 用語辞書（term-corrections.json）の誤→正の一覧（長い語から適用する順）。 */
+function loadTermCorrections() {
+  if (termCorrectionsCache) return termCorrectionsCache;
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(__dirname, "term-corrections.json"), "utf-8"));
+    termCorrectionsCache = Object.entries(raw)
+      .filter(([k, v]) => !k.startsWith("_") && typeof v === "string" && k)
+      .sort((a, b) => b[0].length - a[0].length);
+  } catch {
+    termCorrectionsCache = [];
+  }
+  return termCorrectionsCache;
+}
+
+/** 用語辞書を本文へ適用する（決定的な置換のみ。意味の判断はしない）。 */
+export function applyTermCorrections(text) {
+  let out = String(text);
+  for (const [wrong, right] of loadTermCorrections()) out = out.split(wrong).join(right);
+  return out;
+}
+
 const CAPTION_FONT = FONT_CATALOG.kaku; // buildAssFile が実際に焼く書体(Noto Sans JP Black)と一致させる
 const CAPTION_MAX_LINES = 2; // マスター指示「2行で収まるには」
 // 左右の余白（画面幅に対する割合）。以前は 60px 固定だったが、それは縦型(幅1080)を前提にした値で、
@@ -544,10 +577,8 @@ export function wrapCardText(words, budgetPx, fontSize) {
  * @param {{start:number,end:number}[]} [textWindows] ranges と同じ並びの「字幕に出してよい語」の範囲。
  *   語は開始時刻がこの範囲に入るものだけを使う（区間と少し重なるだけの、捨てた文節の語を出さない）。
  */
-export function buildAssFile(transcript, ranges, assPath, dims, textWindows = null) {
-  const PLAY_RES_X = dims.width;
-  const PLAY_RES_Y = dims.height;
-  const { fontSize, marginLR, marginV, outline, budgetPx } = captionMetrics(dims);
+export function buildCaptionCues(transcript, ranges, dims, textWindows = null) {
+  const { fontSize, budgetPx } = captionMetrics(dims);
 
   let relWords = [];
   let newBase = 0;
@@ -575,12 +606,15 @@ export function buildAssFile(transcript, ranges, assPath, dims, textWindows = nu
       units.push({ ...p });
     }
   }
+  // 用語辞書の決定的な置換はここで済ませる（プログラムが決められる修正はプログラムで。
+  // 2026-11-14 マスター決定「モデル依存度を最小に」）。意味レベルの校正は captions 工程の担当。
+  for (const u of units) u.w = applyTermCorrections(u.w);
   const cards = fixDanglingCardTails(buildCaptionCards(units, budgetPx, fontSize), budgetPx, fontSize);
   const LEAD = 0.05;
   const MAXHOLD = 0.6;
   // 終了時刻は「次のカードの表示開始より前」を絶対条件にする（最低表示時間の底上げより優先。
   // 底上げを先に適用すると、間隔の詰まったカード同士で重なって縦に積み上がる事故が起きる）。
-  const events = cards
+  const cues = cards
     .map((c, i) => {
       const text = wrapCardText(c, budgetPx, fontSize).replace(/[{}]/g, "");
       const start = Math.max(0, c[0].start - LEAD);
@@ -591,11 +625,18 @@ export function buildAssFile(transcript, ranges, assPath, dims, textWindows = nu
       return { start, end, text };
     })
     .filter((e) => e.end > e.start) // 直後のカードと間隔が無さすぎて潰れた場合は表示しない（重複させない）
-    .map((e) => `Dialogue: 0,${assTime(e.start)},${assTime(e.end)},Caption,,0,0,0,,${e.text}`);
+    // ASS の時刻は100分の1秒単位。記録（captions.json）と焼き込みで同じ値になるよう、ここで丸める。
+    .map((e) => ({ start: +e.start.toFixed(2), end: +e.end.toFixed(2), text: e.text }));
+  return { cues };
+}
+
+/** キュー一覧を ASS ファイルの本文にする（スタイルは従来の焼き込みと同じ）。 */
+export function renderAssText(cues, dims) {
+  const { fontSize, marginLR, marginV, outline } = captionMetrics(dims);
   const header = `[Script Info]
 ScriptType: v4.00+
-PlayResX: ${PLAY_RES_X}
-PlayResY: ${PLAY_RES_Y}
+PlayResX: ${dims.width}
+PlayResY: ${dims.height}
 WrapStyle: 2
 
 [V4+ Styles]
@@ -605,7 +646,13 @@ Style: Caption,${CAPTION_FONT.family},${fontSize},&H00FFFFFF,&H00000000,&H000000
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
-  fs.writeFileSync(assPath, header + events.join("\n") + "\n", "utf-8");
+  const events = cues.map((e) => `Dialogue: 0,${assTime(e.start)},${assTime(e.end)},Caption,,0,0,0,,${e.text}`);
+  return header + events.join("\n") + "\n";
+}
+
+export function buildAssFile(transcript, ranges, assPath, dims, textWindows = null) {
+  const { cues } = buildCaptionCues(transcript, ranges, dims, textWindows);
+  fs.writeFileSync(assPath, renderAssText(cues, dims), "utf-8");
 }
 
 // ---------- メイン ----------
@@ -754,6 +801,110 @@ function planMain(jobId) {
   console.log(`\nこの台本案をマスターに見せ、承認をもらったら: node src/edit-job.mjs approve ${jobId}`);
 }
 
+/**
+ * captions: 字幕校正の工程（2026-11-14 マスター決定）。
+ * 生成: 承認済みの編集案から EDL を render と同じ決め方で解決し、字幕キューを作って
+ *   captions.ass（焼き込み用）・captions.txt（校正用一覧）・captions.json（生成の記録）を出す。
+ *   時刻はここで確定し、以後はプログラムの管理下（AI は本文だけを直す）。
+ * 照合（--check）: 校正記録（proof.json）と現在の字幕を照合し、不足を並べる。
+ *   手順は docs/字幕校正の手順.md が正。
+ */
+function captionsMain(jobId, { check = false } = {}) {
+  const job = readInboxJob(jobId);
+  const workDir = path.join(RUNTIME_DIR, "work", jobId);
+  if (!job.settings?.caption) {
+    throw new Error("このジョブは字幕なしの設定です。字幕校正の工程は字幕ありジョブ専用です");
+  }
+  const { units, silences, transcript, plan, planFile, planText } = loadJudgmentInputs(workDir);
+  const problems = validatePlan(plan, units.length);
+  if (problems.length) throw new Error(`編集案に問題があります:\n- ${problems.join("\n- ")}`);
+
+  if (check) {
+    const probs = checkProof({ workDir, planText, plan, units });
+    if (probs.length) {
+      console.error(`字幕校正の照合: 不足が ${probs.length} 件あります:`);
+      for (const p of probs) console.error(`- ${p}`);
+      process.exitCode = 1;
+    } else {
+      console.log("字幕校正の照合: すべて通っています。このまま render できます。");
+    }
+    return;
+  }
+
+  const why = approvalProblem(workDir, planFile, planText);
+  if (why) throw new Error(`字幕は承認済みの編集案から生成します: ${why}`);
+
+  // EDL と区間の決め方は render と同一にする（字幕の時刻が実際の切り出しとずれないため）。
+  const edl = resolveEdl({ plan, units, silences, words: transcript.words || [], source: job.video.path });
+  const fps = probeFps(job.video.path);
+  const aligned = edl.ranges.map((r) => ({ r, a: alignToFrames([r], fps)[0] })).filter((p) => p.a);
+  const ranges = aligned.map(({ a }) => ({ start: a.start, end: a.end }));
+  const textWindows = aligned.map(({ r, a }) => ({ start: r.textStart ?? a.start, end: r.textEnd ?? a.end }));
+  const portrait = job.settings?.aspect === "portrait";
+  const dims = portrait ? { width: 1080, height: 1920 } : probeDimensions(job.video.path);
+
+  const { cues } = buildCaptionCues(transcript, ranges, dims, textWindows);
+
+  // キューごとの由来（区間・文節範囲）を、出力と素材の対応表から決める。
+  let base = 0;
+  const spans = aligned.map(({ r, a }) => {
+    const span = {
+      outStart: base,
+      outEnd: base + (a.end - a.start),
+      srcStart: a.start,
+      srcEnd: a.end,
+      segment: r.segment,
+      fromUnit: r.fromUnit,
+      toUnit: r.toUnit,
+    };
+    base = span.outEnd;
+    return span;
+  });
+  const planHash = sha256(planText);
+  const metaCues = cues.map((cue, i) => ({
+    n: i + 1,
+    start: cue.start,
+    end: cue.end,
+    text: cue.text,
+    ...cueProvenance(cue, spans, units),
+  }));
+
+  fs.writeFileSync(path.join(workDir, "captions.ass"), renderAssText(cues, dims), "utf-8");
+  writeJsonAtomically(path.join(workDir, "captions.json"), {
+    planHash,
+    generatedAt: new Date().toISOString(),
+    cues: metaCues,
+  });
+
+  // 検証フラグは prepare で出ているものを使う。無ければここで出す。
+  let verifyReport = null;
+  const verifyPath = path.join(workDir, "verify.json");
+  if (fs.existsSync(verifyPath)) {
+    try {
+      verifyReport = JSON.parse(fs.readFileSync(verifyPath, "utf-8"));
+    } catch {
+      verifyReport = null;
+    }
+  }
+  if (!verifyReport) {
+    try {
+      verifyReport = verifyJob(workDir);
+    } catch {
+      verifyReport = null;
+    }
+  }
+  const flags = verifyReport ? collectVerifyFlags(verifyReport, plan, units) : [];
+  const violations = checkReadability(cues);
+  fs.writeFileSync(
+    path.join(workDir, "captions.txt"),
+    formatCaptionsTxt({ jobId, planHash, cues, violations, flags }),
+    "utf-8"
+  );
+  console.log(`字幕を生成しました: 字幕 ${cues.length} 件（work/${jobId}/captions.ass / captions.txt / captions.json）`);
+  console.log(`  読みやすさの違反 ${violations.length} 件 / 回答が必要な検証フラグ ${flags.length} 件（どちらも captions.txt の末尾に一覧）`);
+  console.log("  次: docs/字幕校正の手順.md の手順で captions.ass の本文を校正し、proof.json を書いてから render してください。");
+}
+
 /** approve: いまの編集案をマスターが承認したことを記録する。 */
 function approveMain(jobId) {
   const workDir = path.join(RUNTIME_DIR, "work", jobId);
@@ -801,6 +952,22 @@ async function renderMain(jobId, { noSnap = false, noFiller = false, noCaption =
     }
     const decision = { applied: plan.applied ?? [], notApplied: plan.notApplied ?? [] };
 
+    // 字幕校正の門番（2026-11-14 マスター決定）。字幕を焼く書き出しでは、captions 工程の
+    // 生成と校正の照合が通っていないと進めない（未校正は警告ではなく不可）。
+    // 字幕の時刻は標準の EDL で生成されているため、切り分け指定（--no-snap / --no-filler）の
+    // 書き出しでは字幕を焼かない（時刻がずれる）。切り分けには --no-caption を付けること。
+    if (job.settings?.caption && !noCaption) {
+      if (noSnap || noFiller) {
+        throw new NotReadyError("字幕は標準の編集（スナップ・言い淀み除去あり）で生成されています。切り分けの書き出しでは --no-caption を付けて字幕なしにしてください");
+      }
+      try {
+        assertCaptionsProofed({ workDir, planText, plan, units });
+      } catch (err) {
+        throw new NotReadyError(err.message);
+      }
+      console.log("[字幕校正] 照合を通りました。校正済みの captions.ass をそのまま焼きます。");
+    }
+
     checkCancelled(workDir);
     if (noSnap) console.log("[切り分け] 無音スナップを飛ばしました（--no-snap）");
     console.log("[5/8] 言い淀みを切っています…");
@@ -847,15 +1014,13 @@ async function renderMain(jobId, { noSnap = false, noFiller = false, noCaption =
     checkCancelled(workDir);
 
     const portrait = job.settings?.aspect === "portrait";
-    // 縦型は letterbox 先が常に1080x1920なのでprobe不要。横型は元動画の実寸を使う
-    // （trim/concatは解像度を変えないため、書き出し後も同じ実寸になる）。
-    const dims = portrait ? { width: 1080, height: 1920 } : probeDimensions(job.video.path);
 
     const resultPath = path.join(outDir, outName ? `${outName}.mp4` : "result.mp4");
     let assPath = null;
     if (job.settings?.caption && !noCaption) {
+      // 字幕はここでは生成し直さない。captions 工程で生成され、校正の照合を通った
+      // captions.ass をそのまま焼く（上の門番で確認済み）。
       assPath = path.join(workDir, "captions.ass");
-      buildAssFile(transcript, ranges, assPath, dims, textWindows);
       checkCancelled(workDir);
     }
     renderFinal({ videoPath: job.video.path, ranges, portrait, assPath, workDir, outPath: resultPath, fps });
@@ -968,18 +1133,19 @@ async function main() {
   }
   if (cmd === "combine") {
     const tokens = [jobId, ...rest].filter((t) => t != null);
-    const opts = { outName: null, landscape: false, loudnorm: true };
+    const opts = { outName: null, landscape: false, loudnorm: true, fit: "crop" };
     const files = [];
     for (let i = 0; i < tokens.length; i++) {
       if (tokens[i] === "--out" && /^[A-Za-z0-9_-]+$/.test(tokens[i + 1] ?? "")) opts.outName = tokens[++i];
       else if (tokens[i] === "--landscape") opts.landscape = true;
       else if (tokens[i] === "--no-loudnorm") opts.loudnorm = false;
+      else if (tokens[i] === "--fit" && ["crop", "blur"].includes(tokens[i + 1] ?? "")) opts.fit = tokens[++i];
       else if (tokens[i].startsWith("--")) usage();
       else files.push(tokens[i]);
     }
     if (!opts.outName || files.length < 2) usage();
     try {
-      combineMain({ inputs: files, outName: opts.outName, landscape: opts.landscape, loudnorm: opts.loudnorm, runtimeDir: RUNTIME_DIR });
+      combineMain({ inputs: files, outName: opts.outName, landscape: opts.landscape, loudnorm: opts.loudnorm, fit: opts.fit, runtimeDir: RUNTIME_DIR });
     } catch (err) {
       console.error(`失敗: ${err.message}`);
       process.exitCode = 1;
@@ -990,6 +1156,21 @@ async function main() {
     if (!jobId || rest.length) usage();
     try {
       assembleMain({ specPath: jobId, runtimeDir: RUNTIME_DIR });
+    } catch (err) {
+      console.error(`失敗: ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (cmd === "captions") {
+    if (!jobId) usage();
+    let check = false;
+    for (const t of rest) {
+      if (t === "--check") check = true;
+      else usage();
+    }
+    try {
+      captionsMain(jobId, { check });
     } catch (err) {
       console.error(`失敗: ${err.message}`);
       process.exitCode = 1;
