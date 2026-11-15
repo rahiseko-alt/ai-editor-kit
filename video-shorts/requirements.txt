@@ -13,8 +13,11 @@ av==14.2.0
 
 # テンポ計測（tempo / review のテンポ項目）: PySceneDetect
 scenedetect==0.7.3
-# BGMビート同期（assemble の bgmSync）を使う場合のみ追加で入れる（任意）:
-#   pip install librosa
+# BGMビート同期（assemble の bgmSync）: librosa
+# 任意機能だが、版は固定する。未固定のまま入れると、依存解決のたびに違う版が
+# 入って拍検出の結果が変わる事故の元になるため、動作確認済みの版へ固定する
+# （2026-11-15 実証。この機械の実測 1.0.1）。
+librosa==1.0.1
 # 音の掃除（prepare --denoise）は Python ではなく deep-filter の実行ファイルを
 # PATH へ置く（GitHub の Rikorose/DeepFilterNet のリリースから取得）。
 

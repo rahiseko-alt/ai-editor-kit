@@ -156,12 +156,45 @@ function runDoctor() {
     lines.push(`${pass ? "OK" : "NG"}  ${name}${pass ? "" : `\n    → ${fix}`}`);
     if (!pass) ok = false;
   };
+  // 道具のバージョン指定（toolchain.json が唯一の正）。実測値と照合し、不一致は警告ではなく失敗にする。
+  // AI が道具を勝手に更新・代替すると、同じ指示でも結果が変わる事故になるため。
+  let toolchain = null;
+  try {
+    toolchain = JSON.parse(fs.readFileSync(path.join(VIDEO_SHORTS_DIR, "toolchain.json"), "utf-8"));
+  } catch {
+    toolchain = null;
+  }
+  const tcTools = toolchain?.tools ?? {};
+  const parseVersion = (text) => {
+    const m = /(\d+(?:\.\d+)+|\d+)/.exec(text ?? "");
+    return m ? m[1] : null;
+  };
+  // match: "prefix" は指定した桁まで一致すればよい（"8.1" に対して "8.1.2" は一致）。"exact" は完全一致。
+  const versionMatches = (actual, spec) => {
+    if (!actual || !spec?.version) return false;
+    if (spec.match === "exact") return actual === spec.version;
+    const a = actual.split(".");
+    return spec.version.split(".").every((part, i) => a[i] === part);
+  };
+  const checkVersion = (label, actual, spec) => {
+    check(
+      `${label} のバージョン（実測 ${actual ?? "不明"} / 指定 ${spec?.version ?? "なし"}）`,
+      versionMatches(actual, spec),
+      `toolchain.json で指定された ${label} ${spec?.version ?? ""} を入れてください。バージョンを勝手に更新・ダウングレード・代替しないでください`
+    );
+  };
+  if (!toolchain) {
+    check("toolchain.json（道具のバージョン指定）", false, "video-shorts/toolchain.json が読めません。キットを正しく展開してください（バージョン照合ができないため失敗として扱います）");
+  }
   const nodeMajor = Number(process.versions.node.split(".")[0]);
   check(`Node.js ${process.versions.node}`, nodeMajor >= 20, "Node.js 20 以上を https://nodejs.org から入れてください");
+  if (toolchain) checkVersion("Node.js", process.versions.node, tcTools.node);
   const ff = spawnSync("ffmpeg", ["-version"], { encoding: "utf-8" });
   check("ffmpeg", ff.status === 0, "ffmpeg を入れて PATH を通してください（Windows: winget install Gyan.FFmpeg）");
+  if (toolchain && ff.status === 0) checkVersion("ffmpeg", parseVersion(ff.stdout), tcTools.ffmpeg);
   const fp = spawnSync("ffprobe", ["-version"], { encoding: "utf-8" });
   check("ffprobe", fp.status === 0, "ffmpeg と一緒に入ります（上と同じ）");
+  if (toolchain && fp.status === 0) checkVersion("ffprobe", parseVersion(fp.stdout), tcTools.ffprobe);
   const filtersText = ff.status === 0 ? (spawnSync("ffmpeg", ["-hide_banner", "-filters"], { encoding: "utf-8" }).stdout ?? "") : "";
   check(
     "境界検品の画像化（ffmpeg の drawtext / showwavespic）",
@@ -176,6 +209,10 @@ function runDoctor() {
   }
   check(`Python${py ? `（${py}）` : ""}`, !!py, "Python 3.10 以上を https://www.python.org から入れてください");
   if (py) {
+    if (toolchain) {
+      const pyv = spawnSync(py, ["--version"], { encoding: "utf-8" });
+      checkVersion("Python", parseVersion(`${pyv.stdout ?? ""} ${pyv.stderr ?? ""}`), tcTools.python);
+    }
     const mods = spawnSync(py, ["-c", "import importlib.util as u;print(bool(u.find_spec('groq')), bool(u.find_spec('faster_whisper')))"], { encoding: "utf-8" });
     const [hasGroq, hasWhisper] = (mods.stdout ?? "").trim().split(/\s+/).map((s) => s === "True");
     const envFile = path.join(VIDEO_SHORTS_DIR, ".env");
@@ -187,9 +224,47 @@ function runDoctor() {
       `次のどちらかを用意してください:\n      (速い) pip install groq を実行し、video-shorts/.env に GROQ_API_KEY=... を書く（キーは https://console.groq.com で無料発行）\n      (キー不要・遅い) ${py} -m pip install -r video-shorts/requirements.txt`
     );
   }
+  // バージョン点検の時期の通知（キット自体の仕組み。どの環境でも同じ点検が回るようにする）。
+  // 失敗ではないが、無視してよい項目にもしない: 「要対応」として明示し、締めにも再掲する。
+  let inspectionDue = false;
+  if (toolchain) {
+    const last = toolchain.lastVersionCheck;
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(typeof last === "string" ? last : "");
+    if (!m) {
+      inspectionDue = true;
+      lines.push("要対応  バージョン点検: 最終点検日が記録されていません。バージョン点検の時期です。編集作業の前に docs/バージョン点検の手順.md の手順で点検してください");
+    } else {
+      const now = new Date();
+      const days = Math.floor((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(+m[1], +m[2] - 1, +m[3])) / 86400000);
+      if (days >= 30) {
+        inspectionDue = true;
+        lines.push(`要対応  バージョン点検: 最終点検日 ${last} から ${days} 日経過しています。バージョン点検の時期です。編集作業の前に docs/バージョン点検の手順.md の手順で点検してください`);
+      } else {
+        lines.push(`OK  バージョン点検（最終点検日 ${last} / 点検時期まであと ${30 - days} 日）`);
+      }
+    }
+  }
   // 任意の部品（無くても動く。対応する任意機能だけが使えなくなる）
-  const df = spawnSync("deep-filter", ["--help"], { encoding: "utf-8" });
-  lines.push(`任意  音の掃除 deep-filter（prepare --denoise 用）: ${df.status === 0 ? "使える" : "使えない（無くても動きます）"}`);
+  // deep-filter は不在なら任意の扱いのまま。ただし存在して版が指定と違う場合は失敗にする
+  // （版違いの掃除結果で文字起こしが変わる事故を防ぐため）。
+  const dfName = findDeepFilter();
+  if (!dfName) {
+    lines.push("任意  音の掃除 deep-filter（prepare --denoise 用）: 使えない（無くても動きます）");
+  } else if (toolchain) {
+    const dfv = spawnSync(dfName, ["--version"], { encoding: "utf-8" });
+    const dfActual = parseVersion(`${dfv.stdout ?? ""} ${dfv.stderr ?? ""}`);
+    if (versionMatches(dfActual, tcTools["deep-filter"])) {
+      lines.push(`任意  音の掃除 deep-filter（prepare --denoise 用）: 使える（バージョン ${dfActual}、指定どおり）`);
+    } else {
+      check(
+        `deep-filter のバージョン（実測 ${dfActual ?? "不明"} / 指定 ${tcTools["deep-filter"]?.version ?? "なし"}）`,
+        false,
+        `toolchain.json で指定された deep-filter ${tcTools["deep-filter"]?.version ?? ""} を入れてください。バージョンを勝手に更新・ダウングレード・代替しないでください`
+      );
+    }
+  } else {
+    lines.push("任意  音の掃除 deep-filter（prepare --denoise 用）: 使える");
+  }
   if (py) {
     const opt = spawnSync(py, ["-c", "import importlib.util as u;print(bool(u.find_spec('scenedetect')), bool(u.find_spec('librosa')))"], { encoding: "utf-8" });
     const [hasSD, hasLibrosa] = (opt.stdout ?? "").trim().split(/\s+/).map((v) => v === "True");
@@ -198,6 +273,9 @@ function runDoctor() {
   }
   console.log(lines.join("\n"));
   console.log(ok ? "\nすべてそろっています。" : "\n足りない物があります。上の → の手順で入れてから、もう一度 doctor を実行してください。");
+  if (inspectionDue) {
+    console.log("※ バージョン点検の時期が来ています。点検を先送りせず、編集作業の前に docs/バージョン点検の手順.md の手順で点検を行ってください。");
+  }
   return ok ? 0 : 1;
 }
 
