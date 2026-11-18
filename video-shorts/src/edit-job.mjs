@@ -65,6 +65,7 @@ import { reviewJob } from "./review.mjs";
 import { combineMain } from "./combine.mjs";
 import { assembleMain } from "./assemble.mjs";
 import { tempoMain } from "./tempo.mjs";
+import { referenceMain, findVideoUnderstanding } from "./reference.mjs";
 import { findDeepFilter, denoiseAudio } from "./denoise.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -80,6 +81,9 @@ function usage() {
   console.error("                                               （ジョブを登録して prepare まで実行。既定は横型・字幕なし）");
   console.error("       node src/edit-job.mjs prepare <jobId> [--denoise]  （文字起こし〜文節化。--denoise は音を掃除してから文字起こし）");
   console.error("       node src/edit-job.mjs tempo <動画のパス>   （カット位置を検出し、シーン一覧とテンポ統計を出す）");
+  console.error("       node src/edit-job.mjs reference <参考動画のパス> [--no-deep]");
+  console.error("                                               （参考動画の型を測る: カット長の並び・拍との重なり・ズーム・フラッシュ・色。");
+  console.error("                                                assemble の指示ファイルに \"pace\": \"<出た json>\" を書くと場面の長さを合わせる）");
   console.error("       node src/edit-job.mjs plan <jobId>     （編集案を検査し、台本案を表示）");
   console.error("       node src/edit-job.mjs approve <jobId>  （マスターの承認を記録）");
   console.error("       node src/edit-job.mjs captions <jobId> [--check]  （字幕の生成と校正用一覧の出力。--check は校正の照合だけを行う）");
@@ -270,6 +274,26 @@ function runDoctor() {
     const [hasSD, hasLibrosa] = (opt.stdout ?? "").trim().split(/\s+/).map((v) => v === "True");
     lines.push(`任意  テンポ計測 scenedetect（tempo / review のテンポ項目用）: ${hasSD ? "使える" : "使えない（無くても動きます）"}`);
     lines.push(`任意  BGMビート同期 librosa（assemble の bgmSync 用）: ${hasLibrosa ? "使える" : "使えない（無くても動きます）"}`);
+    // 参考動画の深掘り（reference のズーム・フラッシュ・色）。版は toolchain.json の commit で固定する。
+    const vu = findVideoUnderstanding(RUNTIME_DIR);
+    if (!vu) {
+      lines.push("任意  参考動画の深掘り video-understanding-skill（reference 用）: 使えない（無くてもテンポと拍は測れます）");
+    } else {
+      const head = spawnSync("git", ["-C", vu.home, "rev-parse", "HEAD"], { encoding: "utf-8" });
+      const actual = head.status === 0 ? head.stdout.trim() : null;
+      const spec = tcTools["video-understanding-skill"];
+      if (toolchain && spec?.version && actual !== spec.version) {
+        check(
+          `video-understanding-skill の版（実測 ${actual ?? "不明"} / 指定 ${spec.version}）`,
+          false,
+          "toolchain.json で指定された commit を入れ直してください（SETUP-CLAUDE.md の任意部品）。版を勝手に更新しないでください"
+        );
+      } else {
+        const deep = spawnSync(py, ["-c", "import importlib.util as u;print(all(u.find_spec(m) for m in ('numpy','cv2','PIL')))"], { encoding: "utf-8" });
+        const deepOk = (deep.stdout ?? "").trim() === "True";
+        lines.push(`任意  参考動画の深掘り video-understanding-skill（reference 用）: ${deepOk ? "使える（版は指定どおり）" : "使えない（opencv-python-headless と pillow が要ります。requirements.txt）"}`);
+      }
+    }
   }
   console.log(lines.join("\n"));
   console.log(ok ? "\nすべてそろっています。" : "\n足りない物があります。上の → の手順で入れてから、もう一度 doctor を実行してください。");
@@ -1282,6 +1306,17 @@ async function main() {
       console.log(`人間の目線チェックの材料を出しました: ${r.reviewDir}`);
       console.log(`  コンタクトシート ${r.sheets.length} 枚と review.txt（修正案 ${r.proposals.length} 件）`);
       console.log("  → 画像を1枚ずつ開いて合格条件で判定するまで、「完成」として伝えないでください。");
+    } catch (err) {
+      console.error(`失敗: ${err.message}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+  if (cmd === "reference") {
+    const extra = rest.filter((a) => a !== "--no-deep");
+    if (!jobId || extra.length) usage();
+    try {
+      referenceMain({ videoPath: jobId, runtimeDir: RUNTIME_DIR, deep: !rest.includes("--no-deep") });
     } catch (err) {
       console.error(`失敗: ${err.message}`);
       process.exitCode = 1;

@@ -45,6 +45,7 @@
    - 複数素材から場面を切り出して文字を入れる組み立て（来店時→施術→仕上がり等）は `node src/edit-job.mjs assemble <指示ファイル.json>` で行う。指示ファイルに素材・開始秒・長さ・ラベルとテロップ・音の有無（audio: "mute" は BGM を投稿時に付ける前提）を書き、手作業の ffmpeg で場面を作らない（受け取った本人が同じ物を作れることが商品の条件）。
    - assemble の指示ファイルには任意で bgm（曲ファイル）と bgmSync: true が書ける。bgmSync は曲の拍（librosa で取得）に場面の境界を吸着させ、書き出しに BGM を載せる（audio: "mute" は BGM のみ、"keep" は会話を主・BGM を -18dB 目安で下に敷く）。librosa が無い環境では警告を出して同期なしで続行する。
    - テンポの計測は `node src/edit-job.mjs tempo <動画のパス>`（PySceneDetect でカット位置を検出し、シーン一覧・平均と中央値のカット長・冒頭と最長のシーンを outputs/tempo/ へ出す）。競合動画のテンポを実数で測るときと、自分の書き出しの自己点検に使う。review の修正案リストにもテンポの材料が1項目入る。どちらも合否は出さない。
+   - 参考動画（真似したい完成品）を渡されたら `node src/edit-job.mjs reference <参考動画のパス>` で型を測る（カット長の並び・拍との重なり・ズーム・フラッシュ・色を outputs/reference/ へ出す）。assemble の指示ファイルに `"pace": "<出た json>"` を書くと、場面の長さを参考動画のカット長の並びに合わせる（拍同期はその後にかかる）。遷移の種類やズームの作り方は推定なので、ユーザーへは「測った値」と「推定」を分けて伝える。深掘りの部品が無い環境ではテンポと拍だけを測る。
    - 店内の環境音が大きい素材は `node src/edit-job.mjs prepare <jobId> --denoise` を使うと、deep-filter で掃除した音声で文字起こしできる（掃除は文字起こしにだけ効き、動画本体と無音実測は元のまま）。deep-filter が無い環境では警告を出して通常の prepare を続行する。
    - 文字起こしの誤りは字幕の誤りに直結する。prepare の最後に自動で回る検証（`verify`）の要確認（work/<jobId>/verify.txt）を見て、誤りは `src/term-corrections.json` へ誤→正を登録して prepare をやり直す。字幕の行頭に句読点が来る事故は、字幕生成側の禁則処理で防ぐ（対策済み）。
    - 字幕ありジョブでは、承認のあと render の前に、字幕校正の工程を必ず通す（必須工程）。`node src/edit-job.mjs captions <jobId>` で字幕を生成し、`docs/字幕校正の手順.md` の手順どおりに全文を校正して `proof.json` に記録する。時刻はプログラムが持ち、校正で直すのは本文だけ。照合（`captions <jobId> --check`）を通っていない字幕は render で焼けない（プログラム側の門番で止まる）。

@@ -61,12 +61,16 @@ function runSync(cmd, args, opts = {}) {
 function probe(videoPath) {
   const out = runSync("ffprobe", [
     "-v", "error", "-select_streams", "v:0",
-    "-show_entries", "stream=width,height", "-show_entries", "format=duration",
+    "-show_entries", "stream=width,height,duration", "-show_entries", "format=duration",
     "-of", "json", videoPath,
   ], { encoding: "utf-8" });
   const j = JSON.parse(out);
   const st = j.streams?.[0] ?? {};
-  return { width: st.width ?? 0, height: st.height ?? 0, duration: Number(j.format?.duration ?? 0) };
+  // コマを抜く上限は映像の長さで決める。BGM を載せた書き出しは音の方が長く、
+  // 全体の長さ（format）の末尾近くを指すとコマが無く、境界画像の生成が止まる（2026-11-18 発見）。
+  const formatDur = Number(j.format?.duration ?? 0);
+  const videoDur = Number(st.duration ?? 0);
+  return { width: st.width ?? 0, height: st.height ?? 0, duration: videoDur > 0 ? Math.min(videoDur, formatDur || videoDur) : formatDur };
 }
 
 // ---------- 境界の一覧（純粋な計算。テスト対象） ----------

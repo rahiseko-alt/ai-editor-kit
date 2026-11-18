@@ -64,7 +64,20 @@ GROQ_API_KEY=<貼られたキー>
 - **キーの値を返信に書かない。** 「設定しました」とだけ伝える。
 - `.env` は Git に入らない（`.gitignore` 済み）。
 
-### 5. 確かめて報告する
+### 5. 参考動画の深掘りの部品を入れる（任意）
+
+参考動画の型を測る `reference` は、テンポと拍だけなら追加の部品は要らない。ズーム・フラッシュ・遷移の種類・色まで
+測るときだけ、リポジトリの一番上で次を実行する（版は `video-shorts/toolchain.json` の commit に固定）。
+
+```bash
+git clone https://github.com/subh05sus/video-understanding-skill .runtime/tools/video-understanding-skill
+git -C .runtime/tools/video-understanding-skill checkout 344c608d78f13d95ee644fbf3093c954cdad5281
+python -m pip install -r video-shorts/requirements.txt
+```
+
+- 文字を読む部品（macOS は標準、それ以外は tesseract）と顔・姿勢の解析は macOS 向け。Linux と Windows ではテロップの読み取りが弱い。
+
+### 6. 確かめて報告する
 
 ```powershell
 cd video-shorts; node src/edit-job.mjs doctor

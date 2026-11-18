@@ -18,6 +18,10 @@ scenedetect==0.7.3
 # 入って拍検出の結果が変わる事故の元になるため、動作確認済みの版へ固定する
 # （2026-11-15 実証。この機械の実測 1.0.1）。
 librosa==1.0.1
+# 参考動画の深掘り（reference の teardown。video-understanding-skill が使う）: 任意
+# 2026-11-18 Linux・Python 3.13 で動作確認した版。Python 3.12 での確認は次の点検で行う。
+opencv-python-headless==5.1.0.95
+pillow==13.0.0
 # 音の掃除（prepare --denoise）は Python ではなく deep-filter の実行ファイルを
 # PATH へ置く（GitHub の Rikorose/DeepFilterNet のリリースから取得）。
 
