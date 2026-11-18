@@ -13,6 +13,7 @@ AI エージェント（Claude Code など）に渡して使う動画編集エ�
 - **字幕校正ゲート**: 校正記録がない字幕は焼き付けできない。基準は Netflix 日本語 SDH（1行16字、1秒7字、最大2行）、機械検証する
 - **用語辞書**: 決まった誤変換（例: 感色系→寒色系）を文字起こし直後に自動修正する
 - **境界検品**: 全カットの境界画像を自動生成し、頭切れ、尻切れの判定材料にする
+- **参考動画の型**: 真似したい完成動画のカット長の並び、拍との重なり、ズーム、フラッシュ、色を実測する。`assemble` の `pace` に渡すと、場面の長さを参考動画に合わせる
 - **テンポ計測**: PySceneDetect でカット位置を検出し、シーン長、平均、中央値を出す
 - **音声クリーニング**: DeepFilterNet で環境音を抑えた音声を作り、文字起こしに使う（本編の音声は不変）
 - **BGM ビート同期**: librosa で拍を取り、場面の切り替わりを拍に合わせる
@@ -65,6 +66,7 @@ node src/edit-job.mjs doctor
 | `combine` | 複数動画の合算 |
 | `assemble` | 複数素材の切り出しと組み立て |
 | `tempo` | カット位置とテンポの計測 |
+| `reference` | 参考動画の型の計測（assemble の pace 用） |
 
 ## 文書
 
@@ -91,6 +93,8 @@ node src/edit-job.mjs doctor
 | faster-whisper、ctranslate2、onnxruntime | MIT |
 | av（PyAV）、PySceneDetect、numpy | BSD-3-Clause |
 | librosa | ISC |
-| groq、tokenizers | Apache-2.0 |
+| groq、tokenizers、opencv-python-headless | Apache-2.0 |
+| video-understanding-skill（任意。参考動画の深掘り） | MIT |
+| pillow | MIT-CMU（HPND） |
 | DeepFilterNet | MIT / Apache-2.0（デュアル） |
 | ffmpeg | LGPL-2.1 以降または GPL（ビルドによる。外部の道具として各自が導入する） |

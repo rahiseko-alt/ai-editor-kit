@@ -14,6 +14,8 @@
 //                                      // "blur" はピラーボックス（中央に切らずに置き、
 //                                      // 両脇を同じ映像のぼかし背景で埋める）。
 //                                      // 縦素材を landscape で使うときに選ぶ
+//   "pace": "参考動画.json",          // 任意。reference で測った json。場面の長さを参考動画の
+//                                      // カット長の並びに合わせる（clips の duration より優先）
 //   "audio": "mute",                   // "mute"（既定。BGM は投稿時に付ける前提）
 //                                      // または "keep"（素材の音を残し loudnorm で揃える）
 //   "clips": [
@@ -31,6 +33,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { combineVideos, probeClip, videoFitChains, FIT_MODES } from "./combine.mjs";
 import { generateBoundaryViews } from "./inspect/boundary-view.mjs";
+import { applyReferencePace } from "./reference.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FONT_PATH = path.join(__dirname, "fonts", "NotoSansJP-Black.ttf");
@@ -56,6 +59,7 @@ export function validateSpec(spec) {
   if (!/^[A-Za-z0-9_-]+$/.test(spec.out ?? "")) throw new Error("out（出力名）は英数字と - _ だけで書いてください");
   if (spec.audio != null && !["mute", "keep"].includes(spec.audio)) throw new Error('audio は "mute" か "keep" で書いてください');
   if (spec.bgm != null && typeof spec.bgm !== "string") throw new Error("bgm は曲ファイルのパスで書いてください");
+  if (spec.pace != null && typeof spec.pace !== "string") throw new Error("pace は reference で作った json のパスで書いてください");
   if (spec.fit != null && !FIT_MODES.includes(spec.fit)) throw new Error('fit は "crop" か "blur" で書いてください');
   if (!Array.isArray(spec.clips) || spec.clips.length < 1) throw new Error("clips に場面を1つ以上書いてください");
   spec.clips.forEach((c, i) => {
@@ -71,6 +75,7 @@ export function validateSpec(spec) {
     audio: spec.audio ?? "mute",
     bgm: spec.bgm ?? null,
     bgmSync: spec.bgmSync === true,
+    pace: spec.pace ?? null,
     clips: spec.clips.map((c) => ({
       file: c.file,
       start: Number(c.start),
@@ -173,7 +178,20 @@ export function assembleFromSpec({ spec, specDir, runtimeDir }) {
     if (!fs.existsSync(resolved)) throw new Error(`素材がありません: ${resolved}`);
     return { ...clip, file: resolved, sourceDuration: probeClip(resolved).duration };
   });
-  const applied = beatInfo ? snapDurations(resolvedClips, beatInfo.beats) : resolvedClips.map((c) => ({ start: c.start, duration: c.duration, snapped: false, target: null }));
+  // 参考動画の型（任意）。場面の長さを参考動画のカット長の並びに合わせてから、拍同期をかける。
+  let paceInfo = null;
+  let pacedClips = resolvedClips;
+  if (s.pace) {
+    const pacePath = path.isAbsolute(s.pace) ? s.pace : path.resolve(specDir, s.pace);
+    if (!fs.existsSync(pacePath)) throw new Error(`pace の json がありません: ${pacePath}（先に reference で参考動画を測ってください）`);
+    const ref = JSON.parse(fs.readFileSync(pacePath, "utf-8"));
+    const shots = ref?.pace?.shotDurations;
+    if (!Array.isArray(shots) || !shots.length) throw new Error(`pace の json にカット長の並び（pace.shotDurations）がありません: ${pacePath}`);
+    const paced = applyReferencePace(resolvedClips, shots);
+    pacedClips = resolvedClips.map((c, i) => ({ ...c, start: paced[i].start, duration: paced[i].duration }));
+    paceInfo = { pacePath, paced };
+  }
+  const applied = beatInfo ? snapDurations(pacedClips, beatInfo.beats) : pacedClips.map((c) => ({ start: c.start, duration: c.duration, snapped: false, target: null }));
   const segPaths = resolvedClips.map((clip, i) => {
     const segPath = path.join(workDir, `seg${i + 1}.mp4`);
     buildSegment({ ...clip, start: applied[i].start, duration: applied[i].duration }, { segPath, W, H, audio: s.audio, fit: s.fit });
@@ -192,7 +210,7 @@ export function assembleFromSpec({ spec, specDir, runtimeDir }) {
     // BGM を載せる場合は、最終の loudnorm はミックス側で1回だけかける。
     ({ ranges, totalDuration } = combineVideos({ inputs: segPaths, outPath, landscape: s.landscape, fit: s.fit, loudnorm: s.audio === "keep" && !bgmPath }));
   }
-  return { outPath, ranges, totalDuration, segPaths, bgmPath, beatInfo, applied };
+  return { outPath, ranges, totalDuration, segPaths, bgmPath, beatInfo, applied, paceInfo };
 }
 
 // BGM を載せる最終ミックス。mute: BGM のみ。keep: 会話を主、BGM は -18dB 目安で下に敷く。
@@ -214,7 +232,14 @@ export function assembleMain({ specPath, runtimeDir }) {
   const abs = path.resolve(specPath);
   if (!fs.existsSync(abs)) throw new Error(`指示ファイルがありません: ${abs}`);
   const spec = JSON.parse(fs.readFileSync(abs, "utf-8"));
-  const { outPath, ranges, totalDuration, bgmPath, beatInfo, applied } = assembleFromSpec({ spec, specDir: path.dirname(abs), runtimeDir });
+  const { outPath, ranges, totalDuration, bgmPath, beatInfo, applied, paceInfo } = assembleFromSpec({ spec, specDir: path.dirname(abs), runtimeDir });
+  if (paceInfo) {
+    console.log(`参考動画の型: ${paceInfo.pacePath}`);
+    paceInfo.paced.forEach((p, i) => {
+      const short = p.duration + 1e-6 < p.target;
+      console.log(` 場面${i + 1}: ${p.duration} 秒（参考 ${p.target} 秒${short ? "。素材が短いため参考より短い" : ""}）`);
+    });
+  }
   if (beatInfo) {
     console.log(`拍同期: テンポ ${beatInfo.tempo} BPM / 拍 ${beatInfo.beats.length} 件`);
     let cum = 0;
